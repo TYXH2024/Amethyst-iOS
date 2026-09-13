@@ -18,32 +18,148 @@ jobs:
         include:
           - platform: 2
             platform_name: ios
-    
+
     runs-on: macos-14
+
     steps:
       - name: Remove work folders
         run: |
-          echo "before"
+          echo "=== Workspace before cleanup ==="
+          pwd
           ls -lah ./
           rm -rf ./* || true
           rm -rf ./.??* || true
-          echo "after"
+          echo "=== Workspace after cleanup ==="
           ls -lah ./
-          
+
       - name: Checkout repository
         uses: actions/checkout@main
 
       - name: Checkout repository submodules
-        run: git submodule update --init --recursive
+        run: |
+          git submodule update --init --recursive
+
+      - name: Show Xcode and iOS SDK
+        run: |
+          echo "=== Apple build environment ==="
+          xcodebuild -version
+          xcode-select -p
+          echo "clang:"
+          clang --version | head -n 3
+          echo "iPhoneOS SDK:"
+          SDKPATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          SDKVERSION="$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "$SDKPATH"
+          echo "$SDKVERSION"
+          echo "macOS:"
+          sw_vers
+          echo "Architecture:"
+          uname -m
+          echo "================================"
+
+          SDK_MAJOR="$(printf '%s' "$SDKVERSION" | cut -d. -f1)"
+          if [ "$SDK_MAJOR" -lt 14 ]; then
+            echo "::error::The iPhoneOS SDK is older than the project's required 14.0 minimum."
+            exit 1
+          fi
+
+      - name: Install build dependencies
+        run: |
+          set -e
+
+          echo "=== Installing build dependencies ==="
+          brew install make cmake wget ldid-procursus
+          brew install --cask temurin@8
+
+          JAVA_HOME="$(/usr/libexec/java_home -v 1.8)"
+          echo "JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME/bin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/opt/make/libexec/gnubin" >> "$GITHUB_PATH"
+
+          echo "=== Dependency versions ==="
+          echo "GNU Make:"
+          /opt/homebrew/opt/make/libexec/gnubin/gmake --version | head -n 1
+          echo "CMake:"
+          cmake --version | head -n 1
+          echo "JDK:"
+          "$JAVA_HOME/bin/java" -version
+          echo "ldid:"
+          command -v ldid
+          ldid -V || true
+          echo "wget:"
+          wget --version | head -n 1
+          echo "============================"
+
+      - name: Verify project dependency state
+        shell: bash
+        run: |
+          set -e
+
+          echo "=== Project dependency check ==="
+
+          test -f Natives/CMakeLists.txt
+          test -f Natives/JavaLauncher.m
+          test -f Makefile
+          test -f .gitmodules
+
+          echo "--- Git submodules ---"
+          git submodule status
+
+          echo "--- Required bundled directories ---"
+          for path in \
+            Natives/external/AFNetworking \
+            Natives/external/DBNumberedSlider \
+            Natives/external/fishhook \
+            Natives/external/MobileGlues
+          do
+            if [ ! -d "$path" ] || [ -z "$(find "$path" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+              echo "::error::Missing or empty submodule: $path"
+              exit 1
+            fi
+            echo "OK: $path"
+          done
+
+          echo "=== Project dependency state OK ==="
+
+      - name: Apply macOS SDK compatibility fix
+        shell: bash
+        run: |
+          set -e
+
+          # The original source relies on an older/indirect Mach header include.
+          # The macOS-14/Xcode-15 SDK no longer exposes these declarations
+          # transitively to JavaLauncher.m.
+          #
+          # Keep the repository source unchanged: this is a CI-only compatibility
+          # adjustment made in the checked-out workspace before compilation.
+          if ! grep -qE '^[[:space:]]*#include[[:space:]]*<mach/mach\.h>[[:space:]]*$' Natives/JavaLauncher.m; then
+            python3 - <<'PY'
+from pathlib import Path
+
+p = Path("Natives/JavaLauncher.m")
+s = p.read_text()
+
+needle = "#include <unistd.h>\n"
+replacement = needle + "#include <mach/mach.h>\n"
+
+if needle not in s:
+    raise SystemExit("Could not locate the JavaLauncher.m include block.")
+
+p.write_text(s.replace(needle, replacement, 1))
+PY
+          fi
+
+          echo "=== JavaLauncher.m Mach header check ==="
+          grep -n -C 2 '#include <mach/mach.h>' Natives/JavaLauncher.m
 
       - name: Get gl4es latest commit hash
         id: gl4es-sha
-        run: echo "::set-output name=sha::$(echo $(git ls-remote https://github.com/PojavLauncherTeam/gl4es-114-extra refs/heads/master | grep -io '^\S*'))"
+        run: echo "sha=$(git ls-remote https://github.com/PojavLauncherTeam/gl4es-114-extra refs/heads/master | grep -io '^\S*')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Cache gl4es
         uses: actions/cache@main
-        if: false # use gl4es 1.1.5
+        if: false
         id: gl4es-cache
         with:
           path: gl4es/libs
@@ -70,7 +186,7 @@ jobs:
             -DCMAKE_C_FLAGS=-Wno-error=implicit-function-declaration
           cmake --build build --config RelWithDebInfo --target GL
           cp -R lib/libGL.dylib ../Natives/resources/Frameworks/libgl4es_114.dylib
-          
+
       - name: Push gl4es
         if: false && github.event != 'pull_request' && github.ref_name == 'main' && steps.gl4es-cache.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -78,27 +194,6 @@ jobs:
           git add Natives/resources/Frameworks/libgl4es_114.dylib
           git commit -am "CI: Update gl4es"
           git push
-
-      - name: Install build dependencies
-        run: |
-          brew install make cmake wget
-          brew install --cask temurin@8
-          brew install ldid-procursus
-
-          export JAVA_HOME="$(/usr/libexec/java_home -v 1.8)"
-          echo "JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
-          echo "$JAVA_HOME/bin" >> "$GITHUB_PATH"
-          echo "/opt/homebrew/opt/make/libexec/gnubin" >> "$GITHUB_PATH"
-
-          echo "=== Build environment ==="
-          echo "macOS: $(sw_vers -productVersion)"
-          echo "Architecture: $(uname -m)"
-          echo "GNU Make: $(/opt/homebrew/opt/make/libexec/gnubin/gmake --version | head -n 1)"
-          echo "JDK: $JAVA_HOME"
-          "$JAVA_HOME/bin/java" -version
-          echo "ldid: $(command -v ldid)"
-          ldid -V || true
-          echo "========================="
 
       - name: Build for ${{ matrix.platform_name }}
         shell: bash
@@ -108,29 +203,64 @@ jobs:
           export PATH="/opt/homebrew/opt/make/libexec/gnubin:/opt/homebrew/bin:$PATH"
           export JAVA_HOME="$(/usr/libexec/java_home -v 1.8)"
           export BOOTJDK="$JAVA_HOME/bin"
+          export SDKPATH="$(xcrun --sdk iphoneos --show-sdk-path)"
 
           echo "=== Build configuration ==="
           echo "Platform: ${{ matrix.platform_name }} (${{ matrix.platform }})"
+          echo "SDKPATH: $SDKPATH"
+          echo "SDK version: $(xcrun --sdk iphoneos --show-sdk-version)"
           echo "JAVA_HOME: $JAVA_HOME"
           echo "BOOTJDK: $BOOTJDK"
-          echo "PATH: $PATH"
+          echo "GNU Make: $(command -v gmake)"
+          echo "CMake: $(command -v cmake)"
+          echo "ldid: $(command -v ldid)"
           echo "==========================="
 
           if [ "${{ matrix.platform_name }}" == "ios" ]; then
-            # Build IPA and TrollStore TIPA for iOS.
-            # Intentionally run without -j so failures are reported in readable order.
-            echo ">>> Building regular iOS IPA..."
-            gmake dsym package PLATFORM=${{ matrix.platform }} BOOTJDK="$BOOTJDK"
+            echo ">>> Building regular iOS IPA + dSYM..."
+            gmake dsym package PLATFORM=${{ matrix.platform }} \
+              BOOTJDK="$BOOTJDK" SDKPATH="$SDKPATH"
 
-            echo ">>> Building TrollStore TIPA..."
-            gmake dsym package PLATFORM=${{ matrix.platform }} TROLLSTORE_JIT_ENT=1 BOOTJDK="$BOOTJDK"
+            echo ">>> Building TrollStore iOS TIPA + dSYM..."
+            gmake dsym package PLATFORM=${{ matrix.platform }} \
+              TROLLSTORE_JIT_ENT=1 \
+              BOOTJDK="$BOOTJDK" SDKPATH="$SDKPATH"
           elif [ "${{ matrix.platform_name }}" == "tvos" ]; then
-            echo ">>> Building TrollStore TIPA for tvOS..."
-            gmake dsym package PLATFORM=${{ matrix.platform }} TROLLSTORE_JIT_ENT=1 BOOTJDK="$BOOTJDK"
+            echo ">>> Building TrollStore TIPA + dSYM..."
+            gmake dsym package PLATFORM=${{ matrix.platform }} \
+              TROLLSTORE_JIT_ENT=1 \
+              BOOTJDK="$BOOTJDK" SDKPATH="$SDKPATH"
           else
-            echo ">>> Building regular IPA..."
-            gmake dsym package PLATFORM=${{ matrix.platform }} BOOTJDK="$BOOTJDK"
+            echo ">>> Building regular IPA + dSYM..."
+            gmake dsym package PLATFORM=${{ matrix.platform }} \
+              BOOTJDK="$BOOTJDK" SDKPATH="$SDKPATH"
           fi
+
+      - name: Verify generated iOS bundle minimum version
+        if: matrix.platform_name == 'ios'
+        shell: bash
+        run: |
+          set -e
+
+          echo "=== Generated bundle ==="
+          APP="artifacts/AngelAuraAmethyst.app"
+
+          if [ ! -d "$APP" ]; then
+            echo "::error::Expected application bundle was not generated: $APP"
+            find artifacts -maxdepth 3 -print 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "MinimumOSVersion:"
+          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$APP/Info.plist"
+
+          MINIMUM_OS="$(/usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$APP/Info.plist")"
+          if [ "$MINIMUM_OS" != "14.0" ]; then
+            echo "::error::Unexpected MinimumOSVersion: $MINIMUM_OS (expected 14.0)"
+            exit 1
+          fi
+
+          echo "=== Minimum iOS version verified: 14.0 ==="
 
       - name: Upload regular ipa
         uses: actions/upload-artifact@main
